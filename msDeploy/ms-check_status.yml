@@ -1,0 +1,440 @@
+#############################################################################
+# PLAY 1 — AKS: MICROSERVICE HEALTH CHECK
+#############################################################################
+
+- name: AKS Microservice Health Check
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+
+    # ── Skip OnPrem ──────────────────────────────────────────────────────────
+    - name: "[AKS] Skip if not AKS deployment"
+      meta: end_play
+      when: >
+        aks_enable is not defined or
+        not (aks_enable | bool)
+
+    # ── Assert Required Variables ────────────────────────────────────────────
+    - name: "[AKS] Assert required variables"
+      assert:
+        that:
+          - instance_name is defined and instance_name | length > 0
+          - instance_type is defined and instance_type | length > 0
+          - namespace is defined and namespace | length > 0
+          - environment is defined and environment | length > 0
+        fail_msg: "instance_name, instance_type, namespace and environment must be defined."
+
+    # ── Cleanup Old Temp Files ───────────────────────────────────────────────
+    - name: "[AKS] Cleanup old temp files"
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/aks_pods_{{ instance_name }}.txt"
+        - "/tmp/aks_final_report_{{ instance_name }}.txt"
+      ignore_errors: true
+
+    # ── Get Pod Details ──────────────────────────────────────────────────────
+    - name: "[AKS] Get pod details"
+      shell: |
+        kubectl get pods -n "{{ namespace }}" \
+          -l app="{{ instance_name }}" \
+          --no-headers \
+          -o custom-columns=\
+        "NAME:.metadata.name,\
+        STATUS:.status.phase,\
+        READY:.status.containerStatuses[0].ready,\
+        RESTARTS:.status.containerStatuses[0].restartCount,\
+        IMAGE:.status.containerStatuses[0].image,\
+        NODE:.spec.nodeName" 2>/dev/null || echo ""
+      register: pod_details
+      changed_when: false
+
+    # ── Process Each Pod ─────────────────────────────────────────────────────
+    - name: "[AKS] Process pod details and write to file"
+      shell: |
+        HEALTHY=0
+        WARNING=0
+        FAILED=0
+
+        while IFS= read -r POD_LINE; do
+          [ -z "$POD_LINE" ] && continue
+
+          POD_NAME=$(echo "$POD_LINE"    | awk '{print $1}')
+          POD_STATUS=$(echo "$POD_LINE"  | awk '{print $2}')
+          POD_READY=$(echo "$POD_LINE"   | awk '{print $3}')
+          POD_RESTART=$(echo "$POD_LINE" | awk '{print $4}')
+          POD_IMAGE=$(echo "$POD_LINE"   | awk '{print $5}')
+          POD_NODE=$(echo "$POD_LINE"    | awk '{print $6}')
+
+          # Extract version from image tag
+          POD_VERSION=$(echo "$POD_IMAGE" | awk -F':' '{print $NF}')
+
+          # Shorten image for display
+          SHORT_IMAGE=$(echo "$POD_IMAGE" | sed 's|\(.*\)/.*:\(.*\)|\1/...:\2|')
+
+          # Determine pod health
+          if [ "$POD_READY" == "true" ] && [ "$POD_RESTART" -eq 0 ]; then
+            ICON="✅"
+            HEALTH="HEALTHY"
+            HEALTHY=$((HEALTHY + 1))
+          elif [ "$POD_STATUS" == "Running" ]; then
+            ICON="⚠️"
+            HEALTH="WARNING"
+            WARNING=$((WARNING + 1))
+          else
+            ICON="❌"
+            HEALTH="CRITICAL"
+            FAILED=$((FAILED + 1))
+          fi
+
+          echo "${ICON}|${POD_NAME}|${POD_STATUS}|${POD_READY}|${POD_RESTART}|${POD_VERSION}|${SHORT_IMAGE}|${POD_NODE}|${HEALTH}" \
+            >> /tmp/aks_pods_{{ instance_name }}.txt
+
+        done <<< "{{ pod_details.stdout }}"
+
+        echo "${HEALTHY}|${WARNING}|${FAILED}" > /tmp/aks_counts_{{ instance_name }}.txt
+      changed_when: false
+
+    # ── Read Pod Counts ──────────────────────────────────────────────────────
+    - name: "[AKS] Read pod counts"
+      shell: cat /tmp/aks_counts_{{ instance_name }}.txt 2>/dev/null || echo "0|0|0"
+      register: pod_counts
+      changed_when: false
+
+    - name: "[AKS] Parse pod counts"
+      set_fact:
+        aks_healthy_pods:  "{{ pod_counts.stdout.split('|')[0] | trim }}"
+        aks_warning_pods:  "{{ pod_counts.stdout.split('|')[1] | trim }}"
+        aks_failed_pods:   "{{ pod_counts.stdout.split('|')[2] | trim }}"
+
+    # ── Get Deployment Details ───────────────────────────────────────────────
+    - name: "[AKS] Get deployment details"
+      shell: |
+        kubectl get deployment "{{ instance_name }}" -n "{{ namespace }}" \
+          --no-headers \
+          -o custom-columns=\
+        "DESIRED:.spec.replicas,\
+        AVAILABLE:.status.availableReplicas,\
+        READY:.status.readyReplicas" 2>/dev/null || echo "0|0|0"
+      register: deploy_details
+      changed_when: false
+
+    - name: "[AKS] Parse deployment details"
+      set_fact:
+        deploy_desired:   "{{ deploy_details.stdout.split()[0] | default('0') }}"
+        deploy_available: "{{ deploy_details.stdout.split()[1] | default('0') }}"
+        deploy_ready:     "{{ deploy_details.stdout.split()[2] | default('0') }}"
+
+    # ── Overall Status ───────────────────────────────────────────────────────
+    - name: "[AKS] Determine overall status"
+      set_fact:
+        aks_overall_status: >-
+          {%- if aks_failed_pods | int > 0 -%}❌ CRITICAL
+          {%- elif aks_warning_pods | int > 0 -%}⚠️ WARNING
+          {%- else -%}✅ HEALTHY
+          {%- endif -%}
+
+    # ── Build Pod Status Block ───────────────────────────────────────────────
+    - name: "[AKS] Read pod file"
+      shell: cat /tmp/aks_pods_{{ instance_name }}.txt 2>/dev/null || echo ""
+      register: pod_file
+      changed_when: false
+
+    - name: "[AKS] Build pod status block"
+      set_fact:
+        aks_pod_block: |
+          {% for line in pod_file.stdout_lines %}
+          {% set f = line.split('|') %}
+          │
+          │ {{ f[0] }} {{ f[1] }}
+          │    ├ Status   : {{ f[2] }}
+          │    ├ Ready    : {{ f[3] }}
+          │    ├ Restarts : {{ f[4] }}
+          │    ├ Version  : {{ f[5] }}
+          │    ├ Image    : {{ f[6] }}
+          │    └ Node     : {{ f[7] }}
+          {% endfor %}
+
+    # ── Build Final AKS Report ───────────────────────────────────────────────
+    - name: "[AKS] Build final health report"
+      set_fact:
+        aks_final_report: |
+          📊 AKS Microservice Health Report
+          {{ aks_overall_status }}
+          ├─────────────────────────────────────────────────────────────┤
+            Instance      │ {{ instance_name }}
+            Environment   │ {{ environment }}
+            Namespace     │ {{ namespace }}
+            Instance Type │ {{ instance_type }}
+            Jar Version   │ {{ jar_version | default('N/A') }}
+            AKS Enabled   │ {{ aks_enable | default('true') }}
+            Hostname      │ {{ deployment_hostname | default('N/A') }}
+            Healthy Pods  │ {{ aks_healthy_pods }}
+            Warning Pods  │ {{ aks_warning_pods }}
+            Failed Pods   │ {{ aks_failed_pods }}
+          ├─────────────────────────────────────────────────────────────┤
+            🐳 Pod Status
+          {{ aks_pod_block }}
+          ├─────────────────────────────────────────────────────────────┤
+            📦 Deployment & Service
+           
+            📦 Deployment: {{ instance_name }}
+               ├ Desired   : {{ deploy_desired }}
+               ├ Available : {{ deploy_available }}
+               └ Ready     : {{ deploy_ready }}
+          ├─────────────────────────────────────────────────────────────┤
+
+    # ── Print AKS Report ─────────────────────────────────────────────────────
+    - name: "[AKS] Print final health report"
+      debug:
+        msg: "{{ aks_final_report }}"
+
+    # ── Save AKS Report ──────────────────────────────────────────────────────
+    - name: "[AKS] Save final report to file"
+      copy:
+        content: "{{ aks_final_report }}"
+        dest: "/tmp/aks_final_report_{{ instance_name }}.txt"
+
+    # ── Cleanup AKS Temp Files ───────────────────────────────────────────────
+    - name: "[AKS] Cleanup temp files"
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/aks_pods_{{ instance_name }}.txt"
+        - "/tmp/aks_counts_{{ instance_name }}.txt"
+      ignore_errors: true
+
+
+#############################################################################
+# PLAY 2 — ON-PREM: MS VERSION AND STATUS CHECK
+#############################################################################
+
+- name: OnPrem CBV Status Check
+  hosts: "{{ instance_name }}_active_appserver"
+  gather_facts: false
+  serial: 1
+
+  tasks:
+
+    # ── Skip AKS ────────────────────────────────────────────────────────────
+    - name: "[OnPrem] Skip for AKS deployments"
+      meta: end_host
+      when:
+        - aks_enable is defined
+        - aks_enable | bool
+
+    # ── Assert Required Variables ────────────────────────────────────────────
+    - name: "[OnPrem] Assert required variables"
+      assert:
+        that:
+          - instance_name is defined and instance_name | length > 0
+          - instance_type is defined and instance_type | length > 0
+          - tomcat_number is defined
+        fail_msg: "instance_name, instance_type and tomcat_number must be defined."
+
+    # ── Cleanup Old Temp Files ───────────────────────────────────────────────
+    - name: "[OnPrem] Cleanup old temp files"
+      delegate_to: localhost
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/service_status_{{ instance_name }}.csv"
+        - "/tmp/onprem_hosts_{{ instance_name }}.txt"
+      run_once: true
+      ignore_errors: true
+
+    # ── Tomcat Process Check ─────────────────────────────────────────────────
+    - name: "[OnPrem] Check Tomcat process status"
+      shell: |
+        PID=$(ps aux | grep -i "tomcat{{ tomcat_number }}" | grep -v grep | awk '{print $2}' | head -1)
+        if [ -n "$PID" ]; then
+          echo "Running|$PID"
+        else
+          echo "Stopped|N/A"
+        fi
+      register: tomcat_process
+      changed_when: false
+      ignore_errors: true
+
+    - name: "[OnPrem] Parse Tomcat process info"
+      set_fact:
+        tomcat_status: "{{ tomcat_process.stdout.split('|')[0] | default('Unknown') }}"
+        tomcat_pid:    "{{ tomcat_process.stdout.split('|')[1] | default('N/A') }}"
+
+    # ── CBV Endpoint Check ───────────────────────────────────────────────────
+    - name: "[OnPrem] Call CBV endpoint"
+      uri:
+        url: "http://localhost:{{ server_port }}/{{ instance_name }}/getCBV.action"
+        method: GET
+        status_code: 200
+        return_content: true
+        timeout: 15
+        validate_certs: false
+        headers:
+          Accept: "text/plain, */*"
+      register: cbv_response
+      retries: 3
+      delay: 5
+      until: cbv_response.status is defined and cbv_response.status == 200
+      ignore_errors: true
+
+    # ── Parse CBV Response ───────────────────────────────────────────────────
+    - name: "[OnPrem] Parse cbv_app_name and cbv_version - SUCCESS"
+      when:
+        - cbv_response.status is defined
+        - cbv_response.status == 200
+        - cbv_response.content is defined
+      set_fact:
+        cbv_app_name:        "{{ cbv_response.content | regex_search('applicationName\\s*=\\s*\"([^\"]+)\"', '\\1') | first | default('N/A') }}"
+        cbv_version:         "{{ cbv_response.content | regex_search('currentVersion\\s*=\\s*\"([^\"]+)\"', '\\1') | first | default('N/A') }}"
+        cbv_endpoint_status: "UP"
+        cbv_http_code:       "{{ cbv_response.status }}"
+
+    - name: "[OnPrem] Set defaults if CBV endpoint unreachable"
+      when: >
+        cbv_response.status is not defined or
+        cbv_response.status != 200
+      set_fact:
+        cbv_app_name:        "N/A"
+        cbv_version:         "N/A"
+        cbv_endpoint_status: "DOWN"
+        cbv_http_code:       "{{ cbv_response.status | default('000') }}"
+
+    # ── Determine Server Health ──────────────────────────────────────────────
+    - name: "[OnPrem] Determine server health status"
+      set_fact:
+        server_icon: >-
+          {%- if tomcat_status == 'Running' and cbv_endpoint_status == 'UP' -%}✅
+          {%- elif tomcat_status == 'Running' and cbv_endpoint_status == 'DOWN' -%}⚠️
+          {%- else -%}❌
+          {%- endif -%}
+        server_health: >-
+          {%- if tomcat_status == 'Running' and cbv_endpoint_status == 'UP' -%}HEALTHY
+          {%- elif tomcat_status == 'Running' and cbv_endpoint_status == 'DOWN' -%}WARNING
+          {%- else -%}CRITICAL
+          {%- endif -%}
+
+    # ── Write to CSV ─────────────────────────────────────────────────────────
+    - name: "[OnPrem] Write status to CSV"
+      delegate_to: localhost
+      lineinfile:
+        path: "/tmp/service_status_{{ instance_name }}.csv"
+        create: true
+        line: "{{ instance_name }},{{ inventory_hostname }},{{ cbv_app_name }},{{ cbv_version }},{{ tomcat_status }},{{ cbv_endpoint_status }},{{ server_health }}"
+
+    # ── Write Per-Host Block ─────────────────────────────────────────────────
+    - name: "[OnPrem] Write per-host report block"
+      delegate_to: localhost
+      lineinfile:
+        path: "/tmp/onprem_hosts_{{ instance_name }}.txt"
+        create: true
+        line: "{{ server_icon }}|{{ inventory_hostname }}|{{ tomcat_status }}|{{ cbv_version }}|{{ cbv_app_name }}|{{ cbv_endpoint_status }}|{{ cbv_http_code }}|{{ server_health }}"
+
+
+#############################################################################
+# PLAY 3 — ON-PREM: GENERATE FINAL HEALTH REPORT
+#############################################################################
+
+- name: OnPrem Generate Final Health Report
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+
+    # ── Skip AKS ────────────────────────────────────────────────────────────
+    - name: "[OnPrem] Skip for AKS deployments"
+      meta: end_play
+      when:
+        - aks_enable is defined
+        - aks_enable | bool
+
+    # ── Count Health Statuses ────────────────────────────────────────────────
+    - name: "[OnPrem] Count server health statuses"
+      shell: |
+        FILE="/tmp/service_status_{{ instance_name }}.csv"
+        HEALTHY=$(grep -c  "HEALTHY"  "$FILE" 2>/dev/null || echo 0)
+        WARNING=$(grep -c  "WARNING"  "$FILE" 2>/dev/null || echo 0)
+        CRITICAL=$(grep -c "CRITICAL" "$FILE" 2>/dev/null || echo 0)
+        echo "${HEALTHY}|${WARNING}|${CRITICAL}"
+      register: health_counts
+      changed_when: false
+
+    - name: "[OnPrem] Parse health counts"
+      set_fact:
+        healthy_count:  "{{ health_counts.stdout.split('|')[0] | trim }}"
+        warning_count:  "{{ health_counts.stdout.split('|')[1] | trim }}"
+        critical_count: "{{ health_counts.stdout.split('|')[2] | trim }}"
+
+    # ── Overall Status ───────────────────────────────────────────────────────
+    - name: "[OnPrem] Determine overall status"
+      set_fact:
+        onprem_overall_status: >-
+          {%- if critical_count | int > 0 -%}❌ CRITICAL
+          {%- elif warning_count | int > 0 -%}⚠️ WARNING
+          {%- else -%}✅ HEALTHY
+          {%- endif -%}
+
+    # ── Build Per-Host Report Block ──────────────────────────────────────────
+    - name: "[OnPrem] Read host report file"
+      shell: cat /tmp/onprem_hosts_{{ instance_name }}.txt 2>/dev/null || echo ""
+      register: host_file
+      changed_when: false
+
+    - name: "[OnPrem] Build server status block"
+      set_fact:
+        onprem_server_block: |
+          {% for line in host_file.stdout_lines %}
+          {% set f = line.split('|') %}
+          │
+          │ {{ f[0] }} {{ f[1] }}
+          │    ├ Status   : {{ f[2] }}
+          │    ├ Version  : {{ f[3] }}
+          │    ├ App Name : {{ f[4] }}
+          │    └ CBV      : {{ f[5] }} (HTTP {{ f[6] }})
+          {% endfor %}
+
+    # ── Build Final OnPrem Report ────────────────────────────────────────────
+    - name: "[OnPrem] Build final health report"
+      set_fact:
+        onprem_final_report: |
+          📊 On-Prem Microservice Health Report
+          {{ onprem_overall_status }}
+          ├─────────────────────────────────────────────────────────────┤
+            Instance      │ {{ instance_name }}                         
+            Environment   │ {{ jar_env      | default('N/A') }}         
+            Instance Type │ {{ instance_type | default('N/A') }}        
+            App Version   │ {{ jar_version   | default('N/A') }}        
+            Tomcat Number │ {{ tomcat_number | default('N/A') }}        
+            Server Port   │ {{ server_port   | default('N/A') }}        
+            Healthy Svrs  │ {{ healthy_count }}                         
+            Warning Svrs  │ {{ warning_count }}                         
+            Failed Svrs   │ {{ critical_count }}                        
+          ├─────────────────────────────────────────────────────────────┤
+            🖥️  Server Status                                           
+          {{ onprem_server_block }}                                     
+          ├─────────────────────────────────────────────────────────────┤
+
+    # ── Print OnPrem Report ──────────────────────────────────────────────────
+    - name: "[OnPrem] Print final health report"
+      debug:
+        msg: "{{ onprem_final_report }}"
+
+    # ── Save OnPrem Report ───────────────────────────────────────────────────
+    - name: "[OnPrem] Save final report to file"
+      copy:
+        content: "{{ onprem_final_report }}"
+        dest: "/tmp/onprem_final_report_{{ instance_name }}.txt"
+
+    # ── Cleanup Temp Files ───────────────────────────────────────────────────
+    - name: "[OnPrem] Cleanup temp files"
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/service_status_{{ instance_name }}.csv"
+        - "/tmp/onprem_hosts_{{ instance_name }}.txt"
+      ignore_errors: true
