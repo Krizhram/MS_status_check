@@ -56,7 +56,7 @@ env:
 
 jobs:
 
- # validate_user:
+  validate_user:
     uses: ./.github/workflows/validate-sre-devops-user.yml
     secrets:
       ANSIBLE_INV_PAT: ${{ secrets.ANSIBLE_INV_PAT }}
