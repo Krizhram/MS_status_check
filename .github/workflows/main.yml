@@ -1,0 +1,253 @@
+---
+name: 'Microservice: Health Check'
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      instance_name:
+        description: 'Instance Name'
+        required: true
+        type: string
+
+      environment_name:
+        description: 'Environment Name'
+        required: true
+        type: choice
+        options:
+          - aus1
+          - aus2
+          - can1
+          - can2
+          - dat1
+          - deu1
+          - deu2
+          - dev1zus1
+          - dfsg2
+          - osh1
+          - osh2
+          - uat1zus1
+          - prd1zus1
+          - prd1zuk1
+          - prd1zau1
+          - prd1zau2
+          - prd1zde1
+          - prd1zde2
+          - sg1
+          - sg2
+          - uae1
+          - uae2
+          - uatsg1
+          - uatsg2
+          - usa1
+          - usa2
+          - prd1zca1
+          - prd1zca2
+          - prd1zae1
+          - prd1zae2
+          - uat1zuk1
+          - uat1zuk2
+
+run-name: "Health Check - ${{ inputs.instance_name }} (${{ inputs.environment_name }})"
+
+env:
+  ENVIRONMENT_NAME: ${{ github.event.inputs.environment_name }}
+  INSTANCE_NAME: ${{ github.event.inputs.instance_name }}
+
+jobs:
+
+  validate_user:
+    uses: ./.github/workflows/validate-sre-devops-user.yml
+    secrets:
+      ANSIBLE_INV_PAT: ${{ secrets.ANSIBLE_INV_PAT }}
+
+  microservice-health-check:
+    needs: [validate_user]
+    timeout-minutes: 15
+    runs-on: "${{ github.event.inputs.environment_name }}_rhel"
+
+    steps:
+
+      - name: Validate Inputs
+        run: |
+          if [ -z "${{ inputs.instance_name }}" ]; then
+            echo "❌ instance_name cannot be empty"
+            exit 1
+          fi
+
+          if [ -z "${{ inputs.environment_name }}" ]; then
+            echo "❌ environment_name cannot be empty"
+            exit 1
+          fi
+
+          echo "✅ Inputs validated successfully"
+          echo "   Instance    : ${{ inputs.instance_name }}"
+          echo "   Environment : ${{ inputs.environment_name }}"
+
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+
+      - name: Checkout Ansible scripts
+        uses: actions/checkout@v4
+        with:
+          repository: tr/highq_ansible-scripts
+          token: ${{ secrets.ANSIBLE_INV_PAT }}
+          ref: 'main'
+          path: ./newInstanceDeploy
+
+      - name: Checkout Ansible inventories
+        uses: actions/checkout@v4
+        with:
+          repository: tr/highq_ansible-inventories
+          token: ${{ secrets.ANSIBLE_INV_PAT }}
+          path: ./newInstanceDeploy/inventories
+
+      - name: Clear Old Reports
+        run: |
+          rm -f /tmp/service_status_${{ inputs.instance_name }}.csv
+          rm -f /tmp/aks_final_report_${{ inputs.instance_name }}.txt
+          rm -f /tmp/onprem_final_report_${{ inputs.instance_name }}.txt
+          rm -f /tmp/aks_pods_${{ inputs.instance_name }}.txt
+          rm -f /tmp/aks_counts_${{ inputs.instance_name }}.txt
+          rm -f /tmp/onprem_hosts_${{ inputs.instance_name }}.txt
+          echo "✅ Old reports cleared successfully"
+
+      - name: Execute Health Check
+        env:
+          ANSIBLE_VAULT_PASS: ${{ secrets.ANSIBLE_VAULT_PASS }}
+        run: |
+          cd newInstanceDeploy
+
+          ansible-playbook \
+            -i inventories/${ENVIRONMENT_NAME}.yml \
+            -i inventories/group_vars/${ENVIRONMENT_NAME}/${INSTANCE_NAME}/ \
+            -e "env_name=${ENVIRONMENT_NAME}" \
+            -e "environment=${ENVIRONMENT_NAME}" \
+            -e "instance_name=${INSTANCE_NAME}" \
+            -e "target_group=${INSTANCE_NAME}" \
+            msDeploy/ms-check_status.yml \
+            --vault-password-file <(echo "$ANSIBLE_VAULT_PASS")
+
+      - name: Upload Status Report Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "status-reports-${{ inputs.environment_name }}-${{ inputs.instance_name }}"
+          path: |
+            /tmp/service_status_${{ inputs.instance_name }}.csv
+            /tmp/aks_final_report_${{ inputs.instance_name }}.txt
+            /tmp/onprem_final_report_${{ inputs.instance_name }}.txt
+          retention-days: ${{ contains(inputs.environment_name, 'prd') && 90 || 30 }}
+
+      - name: Generate Summary
+        if: always()
+        run: |
+          SERVICE_CSV="/tmp/service_status_${{ inputs.instance_name }}.csv"
+          AKS_REPORT="/tmp/aks_final_report_${{ inputs.instance_name }}.txt"
+          ONPREM_REPORT="/tmp/onprem_final_report_${{ inputs.instance_name }}.txt"
+
+          echo "# 🔍 Microservice Status Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Instance:** \`${{ inputs.instance_name }}\` | **Environment:** \`${{ inputs.environment_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          overall="GREEN"
+
+          # ── OnPrem Service Status ──────────────────────────────────────────
+          if [ -f "$SERVICE_CSV" ]; then
+
+            echo "## 🖥️ OnPrem Service Status" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Service | Host | App Name | Version | Tomcat | CBV | Health |" >> $GITHUB_STEP_SUMMARY
+            echo "|---------|------|----------|---------|--------|-----|--------|" >> $GITHUB_STEP_SUMMARY
+
+            while IFS=',' read -r INSTANCE HOST APP_NAME VERSION TOMCAT_STATUS CBV_STATUS HEALTH
+            do
+              HEALTH=$(echo "$HEALTH" | xargs)
+              CBV_STATUS=$(echo "$CBV_STATUS" | xargs)
+
+              if [ "$HEALTH" = "HEALTHY" ]; then
+                ICON="✅"
+              elif [ "$HEALTH" = "WARNING" ]; then
+                ICON="⚠️"
+                overall="RED"
+              else
+                ICON="🚨"
+                overall="RED"
+              fi
+
+              echo "| \`$INSTANCE\` | \`$HOST\` | \`$APP_NAME\` | $VERSION | $TOMCAT_STATUS | $CBV_STATUS | $ICON $HEALTH |" >> $GITHUB_STEP_SUMMARY
+
+            done < <(tail -n +1 "$SERVICE_CSV")
+
+          else
+            echo "⚠️ No service_status CSV found — OnPrem playbook may have been skipped (AKS deployment) or failed." >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # ── AKS Report ─────────────────────────────────────────────────────
+          if [ -f "$AKS_REPORT" ]; then
+
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## 🐳 AKS Health Report" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat "$AKS_REPORT" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+
+            if grep -q "CRITICAL" "$AKS_REPORT"; then
+              overall="RED"
+            elif grep -q "WARNING" "$AKS_REPORT"; then
+              overall="RED"
+            fi
+
+          else
+            echo "⚠️ No AKS report found — AKS playbook may have been skipped (OnPrem deployment) or failed." >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # ── OnPrem Final Report ────────────────────────────────────────────
+          if [ -f "$ONPREM_REPORT" ]; then
+
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## 🖥️ OnPrem Final Report" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat "$ONPREM_REPORT" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+
+          fi
+
+          # ── Overall Status ─────────────────────────────────────────────────
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$overall" = "GREEN" ]; then
+            echo "## ✅ Overall Status: Healthy" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## 🚨 Overall Status: Unhealthy" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Notify Team on Failure
+        if: failure()
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+        run: |
+          curl -s -X POST "$TEAMS_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"type\": \"message\",
+              \"textFormat\": \"markdown\",
+              \"text\": \"🚨 **Health Check FAILED**\n\n**Instance:** ${{ inputs.instance_name }}\n**Environment:** ${{ inputs.environment_name }}\n**Triggered By:** ${{ github.actor }}\n**Failed Job:** ${{ github.job }}\n**Run URL:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+            }"
+
+      - name: Notify Team on Success
+        if: success()
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+        run: |
+          curl -s -X POST "$TEAMS_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"type\": \"message\",
+              \"textFormat\": \"markdown\",
+              \"text\": \"✅ **Health Check PASSED**\n\n**Instance:** ${{ inputs.instance_name }}\n**Environment:** ${{ inputs.environment_name }}\n**Triggered By:** ${{ github.actor }}\n**Run URL:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+            }"
