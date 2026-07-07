@@ -62,7 +62,7 @@ jobs:
       ANSIBLE_INV_PAT: ${{ secrets.ANSIBLE_INV_PAT }}
 
   microservice-health-check:
-    needs: [validate_user]
+    #needs: [validate_user]
     timeout-minutes: 15
     runs-on: "${{ github.event.inputs.environment_name }}_rhel"
 
